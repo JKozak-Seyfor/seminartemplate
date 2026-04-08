@@ -158,12 +158,19 @@ DŮLEŽITÉ: Vrať POUZE JSON pole o {len(groups)} stringách. Žádný jiný te
     )
 
     text_content = "".join(b.text for b in response.content if hasattr(b, "text"))
-    json_match = re.search(r"\[[\s\S]*\]", text_content)
 
-    try:
-        values = json.loads(json_match.group()) if json_match else []
-    except Exception:
-        values = []
+    # Zkus najít JSON pole — i když je obalené backticky nebo textem
+    json_match = re.search(r"\[[\s\S]*?\]", text_content)
+    parse_error = None
+    values = []
+
+    if json_match:
+        try:
+            values = json.loads(json_match.group())
+        except Exception as e:
+            parse_error = f"JSON parse error: {e}\nRaw: {text_content[:500]}"
+    else:
+        parse_error = f"JSON pole nenalezeno v odpovědi. Raw odpověď:\n{text_content[:800]}"
 
     while len(values) < len(groups):
         values.append(groups[len(values)]["text"])
@@ -174,14 +181,16 @@ DŮLEŽITÉ: Vrať POUZE JSON pole o {len(groups)} stringách. Žádný jiný te
         warning = None
         if val == "__CHYBÍ__":
             val = g["text"]
-            warning = "⚠️ Toto pole nebylo na stránce nalezeno (pravděpodobně termín nebo cena, které se načítají dynamicky). Doplňte ručně."
+            warning = "⚠️ Toto pole nebylo na stránce nalezeno (termín/cena jsou dynamické). Doplňte ručně."
         elif val.strip() == g["text"].strip():
             lower = g["text"].lower()
             if any(kw in lower for kw in DYNAMIC_KEYWORDS):
                 warning = "⚠️ Hodnota se nezměnila — pravděpodobně dynamické pole (termín/cena). Zkontrolujte ručně."
+            else:
+                warning = "⚠️ Hodnota se nezměnila oproti šabloně — zkontrolujte ručně."
         results.append({"value": val, "warning": warning})
 
-    return results
+    return results, parse_error, text_content
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -227,7 +236,7 @@ if st.button("🔍 Zpracovat stránku", type="primary",
 
     with st.spinner("Claude analyzuje obsah stránky..."):
         try:
-            results = extract_from_page(page_text, url, groups, api_key)
+            results, parse_error, raw_response = extract_from_page(page_text, url, groups, api_key)
         except Exception as e:
             st.error(f"Chyba při volání API: {e}")
             st.stop()
@@ -238,7 +247,10 @@ if st.button("🔍 Zpracovat stránku", type="primary",
         st.session_state.pop(f"field_{i}", None)
 
     st.session_state.update({"groups": groups, "results": results,
-                              "xml_str": xml_str, "raw_zip": raw})
+                              "xml_str": xml_str, "raw_zip": raw,
+                              "parse_error": parse_error,
+                              "raw_response": raw_response,
+                              "page_text": page_text})
 
 # ── Kontrola a stažení ────────────────────────────────────────────────────────
 
@@ -287,3 +299,20 @@ if "groups" in st.session_state:
             use_container_width=True,
         )
         st.success("Dokument je připraven ke stažení!")
+
+    # ── Debug panel ───────────────────────────────────────────────────────────
+    with st.expander("🔍 Debug — zobrazit co Claude vrátil (pro řešení problémů)"):
+        parse_error = st.session_state.get("parse_error")
+        raw_response = st.session_state.get("raw_response", "")
+        page_text = st.session_state.get("page_text", "")
+
+        if parse_error:
+            st.error(f"**Chyba parsování:**\n```\n{parse_error}\n```")
+        else:
+            st.success("JSON byl úspěšně naparsován.")
+
+        st.markdown("**Surová odpověď Claudea:**")
+        st.code(raw_response[:2000] if raw_response else "(prázdná)", language=None)
+
+        st.markdown("**Načtený text stránky (prvních 2000 znaků):**")
+        st.code(page_text[:2000] if page_text else "(prázdný)", language=None)
