@@ -232,6 +232,11 @@ if st.button("🔍 Zpracovat stránku", type="primary",
             st.error(f"Chyba při volání API: {e}")
             st.stop()
 
+    # Smaž staré hodnoty text_area — jinak Streamlit ignoruje nový value=
+    old_count = len(st.session_state.get("groups") or [])
+    for i in range(old_count + 5):
+        st.session_state.pop(f"field_{i}", None)
+
     st.session_state.update({"groups": groups, "results": results,
                               "xml_str": xml_str, "raw_zip": raw})
 
