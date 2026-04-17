@@ -55,6 +55,42 @@ def find_green_groups(xml_str: str) -> list[dict]:
     return groups
 
 
+def text_to_word_runs(new_text: str, base_run_xml: str) -> str:
+    """
+    Převede text (potenciálně s \\n) na sekvenci Word runů s <w:br/> místo zalomení.
+    Zachová formátování (tučné, kurzíva atd.) z base_run_xml.
+    """
+    # Odstraň zelené zvýraznění z base runu
+    clean_run = base_run_xml
+    clean_run = clean_run.replace('<w:highlight w:val="green"/>', "")
+    clean_run = clean_run.replace("<w:highlight w:val='green'/>", "")
+
+    # Vyextrahuj rPr (formátování) z base runu
+    rpr_match = re.search(r"<w:rPr>([\s\S]*?)</w:rPr>", clean_run)
+    rpr = f"<w:rPr>{rpr_match.group(1)}</w:rPr>" if rpr_match else ""
+
+    lines = (new_text or "").split("\n")
+    runs = []
+
+    for idx, line in enumerate(lines):
+        escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if idx == 0:
+            # První řádek: použij původní run (zachová veškeré jeho atributy)
+            run = re.sub(
+                r"<w:t[^>]*>[\s\S]*?</w:t>",
+                f'<w:t xml:space="preserve">{escaped}</w:t>',
+                clean_run,
+            )
+            runs.append(run)
+        else:
+            # Každý další řádek: nejdřív run s <w:br/>, pak run s textem
+            runs.append(f"<w:r>{rpr}<w:br/></w:r>")
+            if escaped:
+                runs.append(f'<w:r>{rpr}<w:t xml:space="preserve">{escaped}</w:t></w:r>')
+
+    return "".join(runs)
+
+
 def apply_replacements(xml_str: str, groups: list[dict], replacements: list[str]) -> str:
     items = sorted(
         [{"group": g, "new_text": replacements[i]} for i, g in enumerate(groups)],
@@ -63,13 +99,8 @@ def apply_replacements(xml_str: str, groups: list[dict], replacements: list[str]
     result = xml_str
     for item in items:
         g = item["group"]
-        fr = g["runs"][0]["xml"]
-        fr = fr.replace('<w:highlight w:val="green"/>', "")
-        fr = fr.replace("<w:highlight w:val='green'/>", "")
-        escaped = (item["new_text"] or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        fr = re.sub(r"<w:t[^>]*>[\s\S]*?</w:t>",
-                    f'<w:t xml:space="preserve">{escaped}</w:t>', fr)
-        result = result[: g["start_pos"]] + fr + result[g["end_pos"]:]
+        replacement_xml = text_to_word_runs(item["new_text"], g["runs"][0]["xml"])
+        result = result[: g["start_pos"]] + replacement_xml + result[g["end_pos"]:]
     return result
 
 
