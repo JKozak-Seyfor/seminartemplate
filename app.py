@@ -3,57 +3,11 @@ import zipfile
 import io
 import re
 import json
-import anthropic
 import urllib.request
-import urllib.error
-from html.parser import HTMLParser
 
 st.set_page_config(page_title="Šablona školení", page_icon="📄", layout="centered")
 st.title("📄 Automatické vyplnění šablony školení")
 st.caption("Nahrajte šablonu a zadejte URL stránky školení — zbývající vyplní AI.")
-
-
-# ── Stažení stránky ───────────────────────────────────────────────────────────
-
-class TextExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self._parts = []
-        self._skip = False
-
-    def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "nav", "footer"):
-            self._skip = True
-
-    def handle_endtag(self, tag):
-        if tag in ("script", "style", "nav", "footer"):
-            self._skip = False
-        if tag in ("p", "li", "h1", "h2", "h3", "h4", "br", "div"):
-            self._parts.append("\n")
-
-    def handle_data(self, data):
-        if not self._skip and data.strip():
-            self._parts.append(data.strip())
-
-    def get_text(self):
-        return " ".join(t for t in self._parts if t.strip())
-
-
-def fetch_page_text(url: str) -> tuple[str, str | None]:
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 (compatible; TemplateBot/1.0)"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-        parser = TextExtractor()
-        parser.feed(raw)
-        text = parser.get_text()
-        text = re.sub(r" {2,}", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text[:12000], None
-    except Exception as e:
-        return "", str(e)
 
 
 # ── Word XML helpers ──────────────────────────────────────────────────────────
@@ -119,88 +73,67 @@ def apply_replacements(xml_str: str, groups: list[dict], replacements: list[str]
     return result
 
 
-# ── AI extrakce ───────────────────────────────────────────────────────────────
+# ── Make webhook volání ───────────────────────────────────────────────────────
 
-DYNAMIC_KEYWORDS = {"termín", "datum", "cena", "kč", "price", "date"}
+def call_make_webhook(webhook_url: str, page_url: str, fields: list[str]) -> list[dict]:
+    """
+    Pošle POST na Make webhook s URL stránky a seznamem polí.
+    Make vrátí JSON pole: [{"value": "...", "warning": "..."}, ...]
+    """
+    payload = json.dumps({
+        "url": page_url,
+        "fields": fields,
+    }).encode("utf-8")
 
-
-def extract_from_page(page_text: str, url: str, groups: list[dict], api_key: str) -> list[dict]:
-    client = anthropic.Anthropic(api_key=api_key)
-
-    field_list = "\n".join([
-        f'Pole {i+1}: "{g["text"][:200]}{"..." if len(g["text"]) > 200 else ""}"'
-        for i, g in enumerate(groups)
-    ])
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        messages=[{"role": "user", "content": f"""Zde je obsah webové stránky školení (URL: {url}):
-
----
-{page_text}
----
-
-V šabloně Word dokumentu jsou tato zeleně zvýrazněná pole k aktualizaci:
-{field_list}
-
-Na základě obsahu stránky navrhni nový text pro každé pole. Pravidla:
-- Název školení: přesný název ze stránky
-- Termín/datum: pokud na stránce NENÍ, vrať přesně "__CHYBÍ__"
-- Cena: pokud na stránce NENÍ, vrať přesně "__CHYBÍ__"
-- Jméno lektora: přesné jméno ze stránky
-- Profil lektora: zkopíruj celý profil/bio lektora
-- Obsah/program: zkopíruj celý program ze stránky (i s odrážkami)
-- Pro koho je školení: pokud na stránce, zkopíruj; pokud ne, odvoď z tématu
-- Zachovej původní délku a styl
-
-DŮLEŽITÉ: Vrať POUZE JSON pole o {len(groups)} stringách. Žádný jiný text, žádné backticky."""}],
+    req = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
 
-    text_content = "".join(b.text for b in response.content if hasattr(b, "text"))
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = resp.read().decode("utf-8")
 
-    # Zkus najít JSON pole — i když je obalené backticky nebo textem
-    json_match = re.search(r"\[[\s\S]*?\]", text_content)
-    parse_error = None
-    values = []
+    data = json.loads(body)
 
-    if json_match:
-        try:
-            values = json.loads(json_match.group())
-        except Exception as e:
-            parse_error = f"JSON parse error: {e}\nRaw: {text_content[:500]}"
-    else:
-        parse_error = f"JSON pole nenalezeno v odpovědi. Raw odpověď:\n{text_content[:800]}"
-
-    while len(values) < len(groups):
-        values.append(groups[len(values)]["text"])
-
+    # Make může vrátit buď pole objektů [{"value":...}] nebo pole stringů ["..."]
     results = []
-    for i, g in enumerate(groups):
-        val = values[i] if i < len(values) else g["text"]
-        warning = None
-        if val == "__CHYBÍ__":
-            val = g["text"]
-            warning = "⚠️ Toto pole nebylo na stránce nalezeno (termín/cena jsou dynamické). Doplňte ručně."
-        elif val.strip() == g["text"].strip():
-            lower = g["text"].lower()
-            if any(kw in lower for kw in DYNAMIC_KEYWORDS):
-                warning = "⚠️ Hodnota se nezměnila — pravděpodobně dynamické pole (termín/cena). Zkontrolujte ručně."
-            else:
-                warning = "⚠️ Hodnota se nezměnila oproti šabloně — zkontrolujte ručně."
+    for i, item in enumerate(data):
+        if isinstance(item, dict):
+            val = item.get("value", fields[i] if i < len(fields) else "")
+            warning = item.get("warning", None)
+            # Flaguj pole, která GPT nedokázal vyplnit
+            if val == "__CHYBÍ__" or val.strip() == (fields[i].strip() if i < len(fields) else ""):
+                if not warning:
+                    lower = (fields[i] if i < len(fields) else "").lower()
+                    if any(k in lower for k in ("termín", "datum", "cena", "kč")):
+                        warning = "⚠️ Hodnota nenalezena na stránce — doplňte ručně."
+                if val == "__CHYBÍ__":
+                    val = fields[i] if i < len(fields) else ""
+        else:
+            val = str(item)
+            warning = None
+            if val == "__CHYBÍ__":
+                val = fields[i] if i < len(fields) else ""
+                warning = "⚠️ Hodnota nenalezena na stránce — doplňte ručně."
         results.append({"value": val, "warning": warning})
 
-    return results, parse_error, text_content
+    # Doplň chybějící výsledky
+    while len(results) < len(fields):
+        results.append({"value": fields[len(results)], "warning": None})
+
+    return results
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-api_key = st.secrets.get("ANTHROPIC_API_KEY", "") if hasattr(st, "secrets") else ""
-if not api_key:
-    api_key = st.text_input(
-        "Anthropic API klíč", type="password",
-        help="Váš API klíč z console.anthropic.com. Nebo uložte do Streamlit secrets jako ANTHROPIC_API_KEY.",
-        placeholder="sk-ant-...",
+webhook_url = st.secrets.get("MAKE_WEBHOOK_URL", "") if hasattr(st, "secrets") else ""
+if not webhook_url:
+    webhook_url = st.text_input(
+        "Make webhook URL",
+        help="URL vašeho Custom Webhook scénáře v Make. Uložte ji do Streamlit secrets jako MAKE_WEBHOOK_URL.",
+        placeholder="https://hook.eu2.make.com/...",
     )
 
 st.divider()
@@ -212,7 +145,7 @@ with col2:
     template_file = st.file_uploader("Word šablona (.docx)", type=["docx"])
 
 if st.button("🔍 Zpracovat stránku", type="primary",
-             disabled=not (url and template_file and api_key), use_container_width=True):
+             disabled=not (url and template_file and webhook_url), use_container_width=True):
 
     with st.spinner("Čtu šablonu..."):
         raw = template_file.read()
@@ -227,29 +160,21 @@ if st.button("🔍 Zpracovat stránku", type="primary",
 
     st.success(f"Nalezeno **{len(groups)} zelených polí** v šabloně.")
 
-    with st.spinner("Načítám stránku školení..."):
-        page_text, fetch_error = fetch_page_text(url)
-
-    if fetch_error or not page_text.strip():
-        st.error(f"Nepodařilo se načíst stránku: {fetch_error or 'prázdná odpověď'}")
-        st.stop()
-
-    with st.spinner("Claude analyzuje obsah stránky..."):
+    with st.spinner("Make zpracovává stránku a extrahuje data... (může trvat 15–30 s)"):
         try:
-            results, parse_error, raw_response = extract_from_page(page_text, url, groups, api_key)
+            fields = [g["text"] for g in groups]
+            results = call_make_webhook(webhook_url, url, fields)
         except Exception as e:
-            st.error(f"Chyba při volání API: {e}")
+            st.error(f"Chyba při volání Make webhooku: {e}")
             st.stop()
 
-    # Přímo zapiš nové hodnoty do session state — to přebije widget cache
+    # Přepiš session state před renderem widgetů
     for i, res in enumerate(results):
         st.session_state[f"field_{i}"] = res["value"]
 
     st.session_state.update({"groups": groups, "results": results,
-                              "xml_str": xml_str, "raw_zip": raw,
-                              "parse_error": parse_error,
-                              "raw_response": raw_response,
-                              "page_text": page_text})
+                              "xml_str": xml_str, "raw_zip": raw})
+
 
 # ── Kontrola a stažení ────────────────────────────────────────────────────────
 
@@ -261,23 +186,23 @@ if "groups" in st.session_state:
     results = st.session_state["results"]
     edited = []
 
-    warn_count = sum(1 for r in results if r["warning"])
+    warn_count = sum(1 for r in results if r.get("warning"))
     if warn_count:
         st.warning(
             f"**{warn_count} {'pole vyžaduje' if warn_count == 1 else 'pole vyžadují'} ruční doplnění** "
-            "— termín a cena se na stránce Studiow načítají dynamicky a nelze je automaticky přečíst."
+            "— termín a cena se na Studiow načítají dynamicky a nelze je automaticky přečíst."
         )
 
     for i, g in enumerate(groups):
         res = results[i] if i < len(results) else {"value": g["text"], "warning": None}
         with st.expander(
             f"Pole {i+1} — {g['text'][:55]}{'...' if len(g['text']) > 55 else ''}",
-            expanded=bool(res["warning"])
+            expanded=bool(res.get("warning"))
         ):
             st.markdown(f"**Původní text v šabloně:**\n\n> {g['text'][:300]}{'...' if len(g['text']) > 300 else ''}")
-            if res["warning"]:
+            if res.get("warning"):
                 st.warning(res["warning"])
-            new_val = st.text_area("Nový text", value=res["value"], key=f"field_{i}", height=120)
+            new_val = st.text_area("Nový text", key=f"field_{i}", height=120)
             edited.append(new_val)
 
     st.divider()
@@ -298,20 +223,3 @@ if "groups" in st.session_state:
             use_container_width=True,
         )
         st.success("Dokument je připraven ke stažení!")
-
-    # ── Debug panel ───────────────────────────────────────────────────────────
-    with st.expander("🔍 Debug — zobrazit co Claude vrátil (pro řešení problémů)"):
-        parse_error = st.session_state.get("parse_error")
-        raw_response = st.session_state.get("raw_response", "")
-        page_text = st.session_state.get("page_text", "")
-
-        if parse_error:
-            st.error(f"**Chyba parsování:**\n```\n{parse_error}\n```")
-        else:
-            st.success("JSON byl úspěšně naparsován.")
-
-        st.markdown("**Surová odpověď Claudea:**")
-        st.code(raw_response[:2000] if raw_response else "(prázdná)", language=None)
-
-        st.markdown("**Načtený text stránky (prvních 2000 znaků):**")
-        st.code(page_text[:2000] if page_text else "(prázdný)", language=None)
