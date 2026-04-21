@@ -142,11 +142,7 @@ def call_make_webhook(webhook_url: str, page_url: str, groups: list[dict]) -> li
     """
     # Každé pole pošleme jako objekt s textem a kontextem ze šablony
     fields_payload = [
-        {
-            "text": g["text"],
-            "context": g.get("context", ""),
-            "label": f"[{g.get('context', '')}] {g['text'][:80]}" if g.get("context") else g["text"][:80],
-        }
+        f"[{g['context']}] {g['text'][:80]}" if g.get("context") else g["text"][:80]
         for g in groups
     ]
 
