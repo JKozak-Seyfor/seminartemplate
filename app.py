@@ -12,10 +12,28 @@ st.caption("Nahrajte šablonu a zadejte URL stránky školení — zbývající 
 
 # ── Word XML helpers ──────────────────────────────────────────────────────────
 
+def extract_paragraph_text(p_xml: str) -> str:
+    """Extrahuje čistý text z XML odstavce."""
+    texts = re.findall(r"<w:t[^>]*>([\s\S]*?)</w:t>", p_xml)
+    return "".join(texts).strip()
+
+
 def find_green_groups(xml_str: str) -> list[dict]:
-    groups = []
+    # Nejdřív sesbírej všechny odstavce s jejich textem a pozicí
+    paragraphs = []
     for p_match in re.finditer(r"<w:p[ >][\s\S]*?</w:p>", xml_str):
-        p_xml, p_start, runs, pos = p_match.group(), p_match.start(), [], 0
+        paragraphs.append({
+            "xml": p_match.group(),
+            "start": p_match.start(),
+            "text": extract_paragraph_text(p_match.group()),
+            "is_heading": bool(re.search(r'<w:pStyle w:val="[^"]*[Hh]eading', p_match.group())
+                               or re.search(r"<w:b/>|<w:b\s", p_match.group())),
+        })
+
+    groups = []
+    for p_idx, p_data in enumerate(paragraphs):
+        p_xml, p_start = p_data["xml"], p_data["start"]
+        runs, pos = [], 0
         while pos < len(p_xml):
             s1 = p_xml.find("<w:r>", pos)
             s2 = p_xml.find("<w:r ", pos)
@@ -36,6 +54,7 @@ def find_green_groups(xml_str: str) -> list[dict]:
                 "abs_start": p_start + r_start, "abs_end": p_start + r_end + 6,
             })
             pos = r_end + 6
+
         i = 0
         while i < len(runs):
             if runs[i]["is_green"]:
@@ -44,8 +63,18 @@ def find_green_groups(xml_str: str) -> list[dict]:
                     text += runs[j]["text"]
                     j += 1
                 if text.strip():
+                    # Najdi nejbližší nadpis/label před tímto polem (max 5 odstavců zpět)
+                    context_label = ""
+                    for look_back in range(p_idx - 1, max(p_idx - 6, -1), -1):
+                        candidate = paragraphs[look_back]["text"]
+                        if candidate and len(candidate) < 120:
+                            context_label = candidate
+                            break
+
                     groups.append({
-                        "text": text.strip(), "runs": runs[i:j],
+                        "text": text.strip(),
+                        "context": context_label,
+                        "runs": runs[i:j],
                         "start_pos": runs[i]["abs_start"],
                         "end_pos": runs[j - 1]["abs_end"],
                     })
@@ -106,14 +135,24 @@ def apply_replacements(xml_str: str, groups: list[dict], replacements: list[str]
 
 # ── Make webhook volání ───────────────────────────────────────────────────────
 
-def call_make_webhook(webhook_url: str, page_url: str, fields: list[str]) -> list[dict]:
+def call_make_webhook(webhook_url: str, page_url: str, groups: list[dict]) -> list[dict]:
     """
-    Pošle POST na Make webhook s URL stránky a seznamem polí.
+    Pošle POST na Make webhook s URL stránky a seznamem polí obohacených o kontext.
     Make vrátí JSON pole: [{"value": "...", "warning": "..."}, ...]
     """
+    # Každé pole pošleme jako objekt s textem a kontextem ze šablony
+    fields_payload = [
+        {
+            "text": g["text"],
+            "context": g.get("context", ""),
+            "label": f"[{g.get('context', '')}] {g['text'][:80]}" if g.get("context") else g["text"][:80],
+        }
+        for g in groups
+    ]
+
     payload = json.dumps({
         "url": page_url,
-        "fields": fields,
+        "fields": fields_payload,
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -131,41 +170,33 @@ def call_make_webhook(webhook_url: str, page_url: str, fields: list[str]) -> lis
     # Make může vrátit buď pole objektů [{"value":...}] nebo pole stringů ["..."]
     results = []
     for i, item in enumerate(data):
+        original_text = groups[i]["text"] if i < len(groups) else ""
         if isinstance(item, dict):
-            val = item.get("value", fields[i] if i < len(fields) else "")
+            val = item.get("value", original_text)
             warning = item.get("warning", None)
-            # Flaguj pole, která GPT nedokázal vyplnit
-            if val == "__CHYBÍ__" or val.strip() == (fields[i].strip() if i < len(fields) else ""):
-                if not warning:
-                    lower = (fields[i] if i < len(fields) else "").lower()
-                    if any(k in lower for k in ("termín", "datum", "cena", "kč")):
-                        warning = "⚠️ Hodnota nenalezena na stránce — doplňte ručně."
-                if val == "__CHYBÍ__":
-                    val = fields[i] if i < len(fields) else ""
         else:
             val = str(item)
             warning = None
-            if val == "__CHYBÍ__":
-                val = fields[i] if i < len(fields) else ""
-                warning = "⚠️ Hodnota nenalezena na stránce — doplňte ručně."
+
+        if val == "__CHYBÍ__":
+            val = original_text
+            warning = "⚠️ Hodnota nenalezena na stránce — doplňte ručně."
+        elif val.strip() == original_text.strip():
+            lower = original_text.lower()
+            if any(k in lower for k in ("termín", "datum", "cena", "kč")):
+                warning = "⚠️ Hodnota se nezměnila — zkontrolujte ručně."
+
         results.append({"value": val, "warning": warning})
 
-    # Doplň chybějící výsledky
-    while len(results) < len(fields):
-        results.append({"value": fields[len(results)], "warning": None})
+    while len(results) < len(groups):
+        results.append({"value": groups[len(results)]["text"], "warning": None})
 
     return results
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-webhook_url = st.secrets.get("MAKE_WEBHOOK_URL", "") if hasattr(st, "secrets") else ""
-if not webhook_url:
-    webhook_url = st.text_input(
-        "Make webhook URL",
-        help="URL vašeho Custom Webhook scénáře v Make. Uložte ji do Streamlit secrets jako MAKE_WEBHOOK_URL.",
-        placeholder="https://hook.eu2.make.com/...",
-    )
+webhook_url = "https://hook.eu2.make.com/0osnyixa6ivhkm2rvpjapqdtqqxwlsip"
 
 st.divider()
 
@@ -193,8 +224,7 @@ if st.button("🔍 Zpracovat stránku", type="primary",
 
     with st.spinner("Make zpracovává stránku a extrahuje data... (může trvat 15–30 s)"):
         try:
-            fields = [g["text"] for g in groups]
-            results = call_make_webhook(webhook_url, url, fields)
+            results = call_make_webhook(webhook_url, url, groups)
         except Exception as e:
             st.error(f"Chyba při volání Make webhooku: {e}")
             st.stop()
